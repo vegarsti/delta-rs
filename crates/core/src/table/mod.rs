@@ -618,4 +618,71 @@ mod tests {
             .unwrap();
         (dt, tmp_dir)
     }
+
+    use arrow::{array::ArrayRef, datatypes::Schema};
+    use arrow::{datatypes::Field, record_batch::RecordBatch};
+    use arrow_array::BooleanArray;
+    use std::sync::Arc;
+
+    /// Insert a record batch with a transaction id
+    pub async fn insert_with_tx_id(ops_table: crate::DeltaOps, txn_id: (String, i64)) {
+        let schema = Schema::new(vec![Field::new(
+            "id".to_string(),
+            arrow::datatypes::DataType::Boolean,
+            false,
+        )]);
+        let record_batches = vec![RecordBatch::try_new(
+            schema.into(),
+            vec![Arc::new(BooleanArray::from(vec![true])) as ArrayRef],
+        )
+        .unwrap()];
+        let txn = crate::kernel::Transaction::new(txn_id.0, txn_id.1);
+        let commit_properties = crate::operations::transaction::CommitProperties::default()
+            .with_application_transaction(txn);
+        let writer =
+            crate::operations::write::WriteBuilder::new(ops_table.0.log_store(), ops_table.0.state)
+                .with_commit_properties(commit_properties)
+                .with_input_batches(record_batches);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_idempotent_commit() {
+        // Create table in temporary directory
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        crate::DeltaOps::try_from_uri(&path)
+            .await
+            .unwrap()
+            .create()
+            .with_column("id", DataType::BOOLEAN, false, None)
+            .await
+            .unwrap();
+
+        let txn_id = ("key".to_string(), 1);
+
+        // Write 1
+        insert_with_tx_id(
+            crate::DeltaOps::try_from_uri(&path).await.unwrap(),
+            txn_id.clone(),
+        )
+        .await;
+
+        // Write 2
+        insert_with_tx_id(
+            crate::DeltaOps::try_from_uri(&path).await.unwrap(),
+            txn_id.clone(),
+        )
+        .await;
+
+        let table = crate::DeltaOps::try_from_uri(&path).await.unwrap();
+        let active_files = table
+            .0
+            .get_file_uris()
+            .unwrap()
+            .collect::<Vec<String>>()
+            .len();
+
+        assert_eq!(1, active_files);
+    }
 }

@@ -116,6 +116,10 @@ pub enum TransactionError {
     #[error("Tried committing existing table version: {0}")]
     VersionAlreadyExists(i64),
 
+    /// Version already exists
+    #[error("Tried committing a transaction ID with a version >= existing version")]
+    TransactionIDVersionAlreadyExists,
+
     /// Error returned when reading the delta log object failed.
     #[error("Error serializing commit log to json: {json_err}")]
     SerializeLogJson {
@@ -532,6 +536,28 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
             // unwrap() is safe here due to the above check
             // TODO: refactor to only depend on TableReference Trait
             let read_snapshot = this.table_data.unwrap().eager_snapshot();
+
+            // Check if this commit contains a transaction ID that has already been committed.
+            // If so, don't write this commit to the log, and advance directly to post commit.
+            // Note that this commit may contain multiple transaction IDs, and we only check for the existence of one.
+            let mut transactions = read_snapshot.transactions().unwrap();
+            let commit_exists = transactions.any(|txn| {
+                for app_id in this.data.app_transactions.clone() {
+                    if txn.app_id == app_id.app_id && txn.version >= app_id.version {
+                        return true;
+                    }
+                }
+                return false;
+            });
+            if commit_exists {
+                return Ok(PostCommit {
+                    version: read_snapshot.version(),
+                    data: this.data,
+                    create_checkpoint: false,
+                    log_store: this.log_store,
+                    table_data: this.table_data,
+                });
+            }
 
             let mut attempt_number = 1;
             while attempt_number <= this.max_retries {
